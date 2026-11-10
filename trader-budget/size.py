@@ -88,6 +88,139 @@ FRESH_MINUTES = 15
 SETUP_WORDS = {"orb": "opening-range breakout", "flag": "flag", "bounce": "oversold bounce"}
 
 
+
+# ---------------------------------------------------------------- markets: us (NYSE, the default) or in (NSE India)
+# Pick one with --market us|in (anywhere on the command line), TRADER_MARKET, or "market" in
+# trader/config.json. US stays the default, so nothing changes for anyone who sets nothing.
+# The *_usd keys in the config hold amounts in the market's own currency (rupees for "in").
+
+NSE_HOLIDAYS = {  # NSE circular NSE/FAOP/71777 (Dec 12, 2025) plus NSE/CD/72233 (Jan 15 election)
+    "2026-01-15": "Municipal Corporation Election, Maharashtra",
+    "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+MARKETS = {
+    "us": {"code": "us", "exchange": "NYSE", "city": "New York", "zone": "ET", "currency": "$",
+           "open": datetime.time(9, 30), "close": datetime.time(16, 0), "early": datetime.time(13, 0),
+           "holidays": {}, "early_closes": {}, "holiday_years": (2026, 2027),
+           "flat_by": "15:55", "no_entries_before": "09:45", "no_entries_after": "15:30"},
+    "in": {"code": "in", "exchange": "NSE", "city": "Mumbai", "zone": "IST", "currency": "Rs ",
+           "open": datetime.time(9, 15), "close": datetime.time(15, 30), "early": None,
+           "holidays": NSE_HOLIDAYS, "early_closes": {}, "holiday_years": (2026,),
+           "flat_by": "15:10", "no_entries_before": "09:30", "no_entries_after": "14:45"},
+}
+MARKET = MARKETS["us"]
+
+
+def set_market(code):
+    """Switch this script to a market: "us" or "in". Rebinds OPEN, CLOSE and EARLY."""
+    global MARKET
+    code = str(code or "us").strip().lower()
+    code = {"nyse": "us", "nasdaq": "us", "usa": "us", "nse": "in", "india": "in", "bse": "in"}.get(code, code)
+    if code not in MARKETS:
+        raise ValueError("--market is us or in, not %r" % code)
+    MARKET = MARKETS[code]
+    g = globals()
+    for name, key in (("OPEN", "open"), ("CLOSE", "close"), ("EARLY", "early")):
+        if name in g:
+            g[name] = MARKET[key]      # EARLY is None where the market has no early closes
+    o, c = MARKET["open"], MARKET["close"]
+    e = MARKET["early"] or c
+    for name, val in (("OPEN_MIN", o.hour * 60 + o.minute), ("CLOSE_MIN", c.hour * 60 + c.minute),
+                      ("EARLY_MIN", e.hour * 60 + e.minute),
+                      ("SESSION_BARS", ((c.hour - o.hour) * 60 + c.minute - o.minute) // 5)):
+        if name in g:
+            g[name] = val
+    if isinstance(g.get("DEFAULTS"), dict):      # the entry window and flat-by follow the market
+        for k in ("no_entries_before", "no_entries_after", "flat_by"):
+            if k in g["DEFAULTS"]:
+                g["DEFAULTS"][k] = MARKET[k]
+    return MARKET
+
+
+def take_market(argv):
+    """Strip --market X from argv. Returns (code or None, the rest)."""
+    out, code, i = [], None, 0
+    argv = list(argv)
+    while i < len(argv):
+        x = argv[i]
+        if x == "--market" and i + 1 < len(argv):
+            code, i = argv[i + 1], i + 2
+            continue
+        if x.startswith("--market="):
+            code = x.split("=", 1)[1]
+        else:
+            out.append(x)
+        i += 1
+    return code, out
+
+
+def choose_market(argv, config_path="trader/config.json"):
+    """--market, then TRADER_MARKET, then "market" in the config, then us. Returns the rest of argv."""
+    code, rest = take_market(sys.argv[1:] if argv is None else argv)
+    if not code:
+        code = os.environ.get("TRADER_MARKET")
+    if not code:
+        for i, x in enumerate(rest):
+            if x == "--config" and i + 1 < len(rest):
+                config_path = rest[i + 1]
+            elif x.startswith("--config="):
+                config_path = x.split("=", 1)[1]
+        try:
+            with open(config_path, encoding="utf-8") as fh:
+                code = (json.load(fh) or {}).get("market")
+        except (OSError, ValueError, AttributeError):
+            code = None
+    set_market(code or "us")
+    return rest
+
+
+def market_symbol(sym):
+    """The symbol as this pack stores it: TSLA, or RELIANCE.NS / RELIANCE.BO on NSE / BSE."""
+    s = str(sym or "").strip().upper()
+    if MARKET["code"] == "in" and s and not s.endswith((".NS", ".BO")):
+        s += ".NS"
+    return s
+
+
+def yahoo_symbol(sym):
+    """Yahoo's spelling: BRK-B for BRK.B in the US; RELIANCE.NS as is in India."""
+    if MARKET["code"] == "in":
+        return market_symbol(sym)
+    return str(sym).upper().replace(".", "-")
+
+
+def url_symbol(sym):
+    """yahoo_symbol, made safe for a URL: M&M.NS -> M%26M.NS."""
+    import urllib.parse
+    return urllib.parse.quote(yahoo_symbol(sym), safe=".-^=")
+
+
+def cur():
+    return MARKET["currency"]
+
+
+def holiday_note(day):
+    """A warning when the market's holiday list does not cover this year yet."""
+    if day.year not in MARKET["holiday_years"]:
+        return ("%s has no %s holiday list for %d in this tool yet: weekends are closed, but check the "
+                "exchange's holiday circular before trusting an open day" % (MARKET["exchange"], MARKET["exchange"], day.year))
+    return ""
+
+
 class SizeError(Exception):
     pass
 
@@ -101,6 +234,8 @@ def _nth_sunday(year, month, n):
 
 
 def eastern_offset(utc):
+    if MARKET["code"] == "in":
+        return 5.5      # India: UTC+5:30, no daylight saving
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
@@ -116,6 +251,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["code"] == "in":
+        return local - datetime.timedelta(hours=5.5)
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -167,8 +304,16 @@ def read_json(path, what):
         raise SizeError("%s is not valid JSON: %s" % (path, e))
 
 
+def market_defaults():
+    """DEFAULTS with the active market's entry window and flat-by time."""
+    d = dict(DEFAULTS)
+    for k in ("no_entries_before", "no_entries_after", "flat_by"):
+        d[k] = MARKET[k]
+    return d
+
+
 def load_config(path):
-    cfg = dict(DEFAULTS)
+    cfg = market_defaults()
     if path and os.path.exists(path):
         cfg.update(read_json(path, "config"))
     return cfg
@@ -296,8 +441,8 @@ def _num(x):
 def money(x):
     x = float(x)
     if abs(x - round(x)) < 0.005:
-        return "$" + "{:,.0f}".format(round(x))
-    return "$" + "{:,.2f}".format(x)
+        return cur() + "{:,.0f}".format(round(x))
+    return cur() + "{:,.2f}".format(x)
 
 
 # ---------------------------------------------------------------- plan mode (the default)
@@ -308,20 +453,24 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     limit  the limit price for a limit order (None = market)
     price  a FRESH latest price; a market order is sized at the higher of it and the plan's entry
     cash   the cash in trader/portfolio.json, if there is one
-    today  New York date (YYYY-MM-DD); a plan for another day is refused"""
-    c = dict(DEFAULTS)
+    today  market-local date (YYYY-MM-DD); a plan for another day is refused"""
+    c = market_defaults()
     c.update(cfg or {})
     if not isinstance(plan, dict):
         raise SizeError("the plan is not a JSON object")
     sym = str(plan.get("symbol") or "").strip().upper()
     if not sym:
         raise SizeError("the plan has no symbol (run trader-exit)")
+    if plan.get("market") and str(plan["market"]).lower() != MARKET["code"]:
+        raise SizeError("the plan is for the %s market (%s) but this run is for %s: add --market %s"
+                        % (plan["market"], MARKETS.get(str(plan["market"]).lower(), {}).get("exchange", "?"),
+                           MARKET["exchange"], plan["market"]))
     side = str(plan.get("side") or "buy").strip().lower()
     if side != "buy":
         raise SizeError("this pack sizes long (buy) day trades only; the plan says %r" % side)
     if today and plan.get("date") and str(plan["date"]) != today:
-        raise SizeError("the plan is for %s and today is %s in New York: make a new plan with trader-exit"
-                        % (plan["date"], today))
+        raise SizeError("the plan is for %s and today is %s in %s: make a new plan with trader-exit"
+                        % (plan["date"], today, MARKET["city"]))
     entry_plan, stop, target = _f(plan.get("entry")), _f(plan.get("stop")), _f(plan.get("target"))
     for name, v in (("entry", entry_plan), ("stop", stop), ("target", target)):
         if v is None or v <= 0:
@@ -438,6 +587,11 @@ def bracket_order(s):
                  "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
                  "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
     })
+    if MARKET["code"] == "in":
+        # an NSE / BSE intraday order: the same bracket fields, plus where and how it trades
+        o["exchange"] = "BSE" if s["symbol"].endswith(".BO") else "NSE"
+        o["product"] = "MIS"
+        o["plan"]["market"] = "in"
     return o
 
 
@@ -471,14 +625,18 @@ def plan_report(s, order, notes=()):
                     _price(s["risk_per_share"]), money(s["max_loss"])))
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
-    lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")
+    lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):"
+                 if MARKET["code"] == "us" else "Proposed bracket order (nothing has been placed):")
     how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
     lines.append("  buy %s %s, %s, day, take-profit %s, stop-loss %s"
                  % (order["qty"], order["symbol"], how, order["take_profit_limit_price"],
                     order["stop_loss_stop_price"]))
     if s["flat_by"]:
-        lines.append("Flat by %s New York: anything still open then gets closed (trader-alerts rings, "
-                     "trader-broker flatten)." % s["flat_by"])
+        lines.append("Flat by %s %s: anything still open then gets closed (trader-alerts rings, "
+                     "trader-broker flatten)." % (s["flat_by"], MARKET["city"]))
+    if MARKET["code"] == "in":
+        lines.append("India: an intraday (MIS) order on %s. Brokerage, STT and exchange charges come on top of "
+                     "the max loss, and a stock at its circuit limit may not fill at all." % order["exchange"])
     lines.append("")
     lines.append("Next: trader-risk checks it, then trader-broker asks you yes or no.")
     lines.append("Education and tooling, not financial advice.")
@@ -651,11 +809,11 @@ def size(rows, cfg, budget=None, prices=None, whole=None, cents=False, top=None)
             break
         worst = min(small, key=lambda r: (r["source_weight"], r["ticker"]))
         if whole and shares is not None and shares[worst["ticker"]] == 0 and prices.get(worst["ticker"], 0) > 0:
-            reason = ("one share costs $%s, more than its slice; it cannot be bought in whole shares"
-                      % _num(prices[worst["ticker"]]))
+            reason = ("one share costs %s%s, more than its slice; it cannot be bought in whole shares"
+                      % (cur(), _num(prices[worst["ticker"]])))
         else:
-            reason = "its slice ($%s) is under your $%s minimum order" % (
-                _num(dollars[worst["ticker"]]), _num(min_order))
+            reason = "its slice (%s%s) is under your %s%s minimum order" % (
+                cur(), _num(dollars[worst["ticker"]]), cur(), _num(min_order))
         dropped.append({"ticker": worst["ticker"], "reason": reason})
         keep = [r for r in keep if r["ticker"] != worst["ticker"]]
         if not keep:
@@ -793,12 +951,12 @@ def run_plan(a, cfg):
         if p is not None and fresh:
             price = p
             if round_cent(p) > round_cent(_f(plan.get("entry")) or 0):
-                notes.append("%s last %s (as of %s New York) is above the plan's entry %s, so the risk "
-                             "is bigger: sized at %s." % (sym, _price(p), to_eastern(t).strftime("%H:%M"),
+                notes.append("%s last %s (as of %s %s) is above the plan's entry %s, so the risk "
+                             "is bigger: sized at %s." % (sym, _price(p), to_eastern(t).strftime("%H:%M"), MARKET["city"],
                                                           _price(plan.get("entry")), _price(p)))
         elif p is not None:
             notes.append("%s in %s is %s: not used (older than %d minutes). Sized at the plan's entry."
-                         % (sym, ppath, ("from " + to_eastern(t).strftime("%Y-%m-%d %H:%M") + " New York")
+                         % (sym, ppath, ("from " + to_eastern(t).strftime("%Y-%m-%d %H:%M") + " " + MARKET["city"])
                             if t else "undated", FRESH_MINUTES))
     cash = None
     if a.portfolio and os.path.exists(a.portfolio):
@@ -854,7 +1012,7 @@ def main(argv=None):
     ap.add_argument("--prices", help="prices JSON (default trader/prices.json if it exists)")
     ap.add_argument("--portfolio", default="trader/portfolio.json",
                     help="your account; its cash caps the size if it exists")
-    ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
+    ap.add_argument("--now", help="pretend it is this market time (New York or IST), e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--write", nargs="?", const="trader/orders.json", metavar="PATH",
                     help="write the proposed order (default trader/orders.json)")
     ap.add_argument("--json", action="store_true", help="print JSON instead of the report")
@@ -864,6 +1022,11 @@ def main(argv=None):
     g.add_argument("--top", type=int, help="keep only the N biggest weights")
     g.add_argument("--whole-shares", action="store_true", help="whole shares only (needs --prices)")
     g.add_argument("--cents", action="store_true", help="size to the cent instead of whole dollars")
+    try:
+        argv = choose_market(argv)
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
     a = ap.parse_args(argv)
     try:
         cfg = load_config(a.config)

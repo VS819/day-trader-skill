@@ -191,6 +191,10 @@ oversold bounce).
 It never places, sizes or checks an order, never says which stock to buy,
 never calls data real time, and never promises that a setup works.
 
+## India (NSE)
+
+Add `--market in` (or `"market": "in"` in `trader/config.json`, or `TRADER_MARKET=in`) to run on the National Stock Exchange of India: IST (UTC+5:30), the 9:15 to 15:30 session, the 2026 NSE holidays, rupees, and Yahoo's `.NS` symbols (RELIANCE becomes RELIANCE.NS; `.BO` for BSE). US is the default. `universe` reads NSE's EQUITY_L.csv and keeps the EQ series in `trader/universe-nse.txt`; `daily` and `orb` scan it with the 9:15 opening range.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

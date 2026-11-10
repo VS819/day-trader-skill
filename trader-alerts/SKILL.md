@@ -148,6 +148,10 @@ watched; with `add --opening-bell`, the bell rings at 9:30.
 It never places, cancels or changes an order, never claims a quote is
 live, and never predicts where a price is going.
 
+## India (NSE)
+
+Add `--market in` (or `"market": "in"` in `trader/config.json`, or `TRADER_MARKET=in`) to run on the National Stock Exchange of India: IST (UTC+5:30), the 9:15 to 15:30 session, the 2026 NSE holidays, rupees, and Yahoo's `.NS` symbols (RELIANCE becomes RELIANCE.NS; `.BO` for BSE). US is the default. Quotes come from Yahoo (Stooq does not cover NSE here); `clock` and the opening bell follow NSE hours and holidays.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

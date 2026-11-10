@@ -154,6 +154,10 @@ It never places, approves or schedules an order, never raises a limit on its
 own, never shrinks a stop to fit more shares, and never sizes options,
 margin or short positions.
 
+## India (NSE)
+
+Add `--market in` (or `"market": "in"` in `trader/config.json`, or `TRADER_MARKET=in`) to run on the National Stock Exchange of India: IST (UTC+5:30), the 9:15 to 15:30 session, the 2026 NSE holidays, rupees, and Yahoo's `.NS` symbols (RELIANCE becomes RELIANCE.NS; `.BO` for BSE). US is the default. Start from `config.india.example.json`. The `*_usd` keys hold rupees. The order carries `"exchange": "NSE"` and `"product": "MIS"`; brokerage, STT and exchange charges come on top of the max loss.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

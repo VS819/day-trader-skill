@@ -69,6 +69,7 @@ Exit code 0 when the scan found something, 1 when it did not or could not run.
 """
 
 import argparse
+import csv
 import datetime
 import gzip
 import json
@@ -91,6 +92,9 @@ BAR_MIN = 5
 MAX_CONFIRM = 200   # stage-2 v8 charts per orb scan, most traded first
 MIN_DAILY_BARS = 30
 DEFAULT_UNIVERSE = "trader/universe.txt"
+NSE_UNIVERSE = "trader/universe-nse.txt"
+NSE_EQUITY_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+NSE_FILE = "EQUITY_L.csv"
 NOTE = "A scan is a list of charts that match a rule, not a list of stocks to buy."
 
 NYSE_HOLIDAYS = {
@@ -125,6 +129,157 @@ OPEN = datetime.time(9, 30)
 CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
 
+# ---------------------------------------------------------------- markets: us (NYSE, the default) or in (NSE India)
+# Pick one with --market us|in (anywhere on the command line), TRADER_MARKET, or "market" in
+# trader/config.json. US stays the default, so nothing changes for anyone who sets nothing.
+# The *_usd keys in the config hold amounts in the market's own currency (rupees for "in").
+
+NSE_HOLIDAYS = {  # NSE circular NSE/FAOP/71777 (Dec 12, 2025) plus NSE/CD/72233 (Jan 15 election)
+    "2026-01-15": "Municipal Corporation Election, Maharashtra",
+    "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+MARKETS = {
+    "us": {"code": "us", "exchange": "NYSE", "city": "New York", "zone": "ET", "currency": "$",
+           "open": datetime.time(9, 30), "close": datetime.time(16, 0), "early": datetime.time(13, 0),
+           "holidays": NYSE_HOLIDAYS, "early_closes": NYSE_EARLY_CLOSE, "holiday_years": (2026, 2027),
+           "flat_by": "15:55", "no_entries_before": "09:45", "no_entries_after": "15:30"},
+    "in": {"code": "in", "exchange": "NSE", "city": "Mumbai", "zone": "IST", "currency": "Rs ",
+           "open": datetime.time(9, 15), "close": datetime.time(15, 30), "early": None,
+           "holidays": NSE_HOLIDAYS, "early_closes": {}, "holiday_years": (2026,),
+           "flat_by": "15:10", "no_entries_before": "09:30", "no_entries_after": "14:45"},
+}
+MARKET = MARKETS["us"]
+
+
+def set_market(code):
+    """Switch this script to a market: "us" or "in". Rebinds OPEN, CLOSE and EARLY."""
+    global MARKET
+    code = str(code or "us").strip().lower()
+    code = {"nyse": "us", "nasdaq": "us", "usa": "us", "nse": "in", "india": "in", "bse": "in"}.get(code, code)
+    if code not in MARKETS:
+        raise ValueError("--market is us or in, not %r" % code)
+    MARKET = MARKETS[code]
+    g = globals()
+    for name, key in (("OPEN", "open"), ("CLOSE", "close"), ("EARLY", "early")):
+        if name in g:
+            g[name] = MARKET[key]      # EARLY is None where the market has no early closes
+    o, c = MARKET["open"], MARKET["close"]
+    e = MARKET["early"] or c
+    for name, val in (("OPEN_MIN", o.hour * 60 + o.minute), ("CLOSE_MIN", c.hour * 60 + c.minute),
+                      ("EARLY_MIN", e.hour * 60 + e.minute),
+                      ("SESSION_BARS", ((c.hour - o.hour) * 60 + c.minute - o.minute) // 5)):
+        if name in g:
+            g[name] = val
+    if isinstance(g.get("DEFAULTS"), dict):      # the entry window and flat-by follow the market
+        for k in ("no_entries_before", "no_entries_after", "flat_by"):
+            if k in g["DEFAULTS"]:
+                g["DEFAULTS"][k] = MARKET[k]
+    return MARKET
+
+
+def take_market(argv):
+    """Strip --market X from argv. Returns (code or None, the rest)."""
+    out, code, i = [], None, 0
+    argv = list(argv)
+    while i < len(argv):
+        x = argv[i]
+        if x == "--market" and i + 1 < len(argv):
+            code, i = argv[i + 1], i + 2
+            continue
+        if x.startswith("--market="):
+            code = x.split("=", 1)[1]
+        else:
+            out.append(x)
+        i += 1
+    return code, out
+
+
+class _LocalWords(object):
+    """With --market in, the words a person reads follow the market: $ -> Rs, ET -> IST,
+    New York -> Mumbai, NYSE -> NSE. Wraps stdout only; files and JSON keys are untouched."""
+    SWAPS = ((re.compile(r"\$(?=[0-9(+-])"), "Rs "), (re.compile(r"\bET\b"), "IST"),
+             (re.compile(r"New York"), "Mumbai"), (re.compile(r"\bNYSE\b"), "NSE"))
+
+    def __init__(self, stream):
+        self._s = stream
+
+    def write(self, text):
+        for rx, rep in self.SWAPS:
+            text = rx.sub(rep, text)
+        return self._s.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
+def choose_market(argv, config_path="trader/config.json"):
+    """--market, then TRADER_MARKET, then "market" in the config, then us. Returns the rest of argv."""
+    code, rest = take_market(sys.argv[1:] if argv is None else argv)
+    if not code:
+        code = os.environ.get("TRADER_MARKET")
+    if not code:
+        for i, x in enumerate(rest):
+            if x == "--config" and i + 1 < len(rest):
+                config_path = rest[i + 1]
+            elif x.startswith("--config="):
+                config_path = x.split("=", 1)[1]
+        try:
+            with open(config_path, encoding="utf-8") as fh:
+                code = (json.load(fh) or {}).get("market")
+        except (OSError, ValueError, AttributeError):
+            code = None
+    set_market(code or "us")
+    if MARKET["code"] != "us" and not isinstance(sys.stdout, _LocalWords):
+        sys.stdout = _LocalWords(sys.stdout)
+    return rest
+
+
+def market_symbol(sym):
+    """The symbol as this pack stores it: TSLA, or RELIANCE.NS / RELIANCE.BO on NSE / BSE."""
+    s = str(sym or "").strip().upper()
+    if MARKET["code"] == "in" and s and not s.endswith((".NS", ".BO")):
+        s += ".NS"
+    return s
+
+
+def yahoo_symbol(sym):
+    """Yahoo's spelling: BRK-B for BRK.B in the US; RELIANCE.NS as is in India."""
+    if MARKET["code"] == "in":
+        return market_symbol(sym)
+    return str(sym).upper().replace(".", "-")
+
+
+def url_symbol(sym):
+    """yahoo_symbol, made safe for a URL: M&M.NS -> M%26M.NS."""
+    import urllib.parse
+    return urllib.parse.quote(yahoo_symbol(sym), safe=".-^=")
+
+
+def cur():
+    return MARKET["currency"]
+
+
+def holiday_note(day):
+    """A warning when the market's holiday list does not cover this year yet."""
+    if day.year not in MARKET["holiday_years"]:
+        return ("%s has no %s holiday list for %d in this tool yet: weekends are closed, but check the "
+                "exchange's holiday circular before trusting an open day" % (MARKET["exchange"], MARKET["exchange"], day.year))
+    return ""
+
 SETUPS = [
     ("breakout_20d", "20-day closing-high breakout"),
     ("bull_flag", "bull flag"),
@@ -148,6 +303,8 @@ def _nth_sunday(year, month, n):
 
 
 def eastern_offset(utc):
+    if MARKET["code"] == "in":
+        return 5.5      # India: UTC+5:30, no daylight saving
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
@@ -163,6 +320,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["code"] == "in":
+        return local - datetime.timedelta(hours=5.5)
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -192,7 +351,7 @@ def parse_now(text):
 def parse_hhmm(text, flag="--at"):
     m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", text or "")
     if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
-        raise ScanError("%s wants a New York time like 10:15" % flag)
+        raise ScanError("%s wants a %s time like 10:15" % (flag, MARKET["city"]))
     return datetime.time(int(m.group(1)), int(m.group(2)))
 
 
@@ -200,7 +359,7 @@ def trading_day(d):
     """(is_trading_day, reason). Weekends and the NYSE holiday list."""
     if d.weekday() >= 5:
         return False, "weekend"
-    name = NYSE_HOLIDAYS.get(d.isoformat())
+    name = MARKET["holidays"].get(d.isoformat())
     if name:
         return False, "NYSE holiday: " + name
     return True, ""
@@ -211,7 +370,7 @@ def session(d):
     ok, _ = trading_day(d)
     if not ok:
         return None
-    return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
+    return OPEN, (EARLY if d.isoformat() in MARKET["early_closes"] else CLOSE)
 
 
 def clock_label(t):
@@ -268,16 +427,16 @@ def yahoo_get(path):
 
 
 def to_yahoo(sym):
-    return sym.upper().replace(".", "-")
+    return yahoo_symbol(sym)
 
 
 def spark_path(symbols, rng, interval):
     return "/v7/finance/spark?symbols=%s&range=%s&interval=%s" % (
-        ",".join(to_yahoo(s) for s in symbols), rng, interval)
+        ",".join(url_symbol(s) for s in symbols), rng, interval)
 
 
 def chart_path(sym, rng, interval):
-    return "/v8/finance/chart/%s?range=%s&interval=%s" % (to_yahoo(sym), rng, interval)
+    return "/v8/finance/chart/%s?range=%s&interval=%s" % (url_symbol(sym), rng, interval)
 
 
 # ---------------------------------------------------------------- parsing
@@ -671,9 +830,9 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None):
             raise ScanError("The market closed at %s ET on %s. Replay the session with --at 10:15."
                             % (clock_label(close_dt), day_label(day)))
     if cutoff < first_close:
-        raise ScanError("It is %s ET: the %d-minute opening range runs 9:30 to %s and the first bar after it "
+        raise ScanError("It is %s ET: the %d-minute opening range runs %s to %s and the first bar after it "
                         "closes at %s. Run orb again after %s."
-                        % (clock_label(cutoff), or_minutes, clock_label(range_end), clock_label(first_close),
+                        % (clock_label(cutoff), or_minutes, clock_label(OPEN), clock_label(range_end), clock_label(first_close),
                            clock_label(first_close)))
     if until is not None and cutoff.time() > until:
         raise ScanError("It is %s ET, after %s, your last time for new entries (no_entries_after): an "
@@ -770,13 +929,13 @@ def fetch_spark(symbols, rng, interval, pause, a=None):
 
 def read_symbols(a, offline_syms=None):
     if a.symbols:
-        syms = [s for s in re.split(r"[,\s]+", a.symbols.upper()) if s]
+        syms = [market_symbol(s) for s in re.split(r"[,\s]+", a.symbols.upper()) if s]
     elif a.watchlist:
         syms = symbols_from_file(a.watchlist)
     elif offline_syms is not None and not a.universe:
         syms = sorted(offline_syms)  # offline: every chart in the file, unless a list was given
     else:
-        path = a.universe or DEFAULT_UNIVERSE
+        path = a.universe or (DEFAULT_UNIVERSE if MARKET["code"] == "us" else NSE_UNIVERSE)
         if not os.path.exists(path):
             raise ScanError("no %s yet: run `scan.py universe` first, or pass --symbols" % path)
         syms = symbols_from_file(path)
@@ -802,12 +961,12 @@ def symbols_from_file(path):
         except ValueError as e:
             raise ScanError("%s is not valid JSON: %s" % (path, e))
         items = doc.get("hits", []) if isinstance(doc, dict) else doc
-        return [str(x.get("symbol") if isinstance(x, dict) else x).upper() for x in items if x]
+        return [market_symbol(x.get("symbol") if isinstance(x, dict) else x) for x in items if x]
     out = []
     for ln in text.splitlines():
         ln = ln.strip()
         if ln and not ln.startswith("#"):
-            out.append(ln.split("|")[0].strip().upper())
+            out.append(market_symbol(ln.split("|")[0]))
     return out
 
 
@@ -832,12 +991,73 @@ def write_json(path, doc):
 
 
 def money(x):
-    return "${:,.2f}".format(x)
+    return cur() + "{:,.2f}".format(x)
 
 
 # ---------------------------------------------------------------- commands
 
+def build_nse_universe(text):
+    """NSE's EQUITY_L.csv -> (kept [(SYM.NS, name)], counts). Keeps the EQ series: the rolling-settlement
+    shares you can trade intraday. BE / BZ (trade-for-trade) and SME series are dropped."""
+    lines = [ln for ln in text.replace("\r", "").split("\n") if ln.strip()]
+    if not lines:
+        raise ScanError("NSE's equity list is empty")
+    hdr = [h.strip().upper() for h in next(csv.reader([lines[0]]))]
+    if "SYMBOL" not in hdr or "SERIES" not in hdr:
+        raise ScanError("not NSE's EQUITY_L.csv (header %s)" % lines[0][:60])
+    kept, counts = {}, {"rows": 0}
+    for row in csv.reader(lines[1:]):
+        r = dict(zip(hdr, [x.strip() for x in row]))
+        counts["rows"] += 1
+        series = r.get("SERIES", "")
+        why = "keep" if series == "EQ" else "series %s" % (series or "blank")
+        counts[why] = counts.get(why, 0) + 1
+        if why == "keep" and r.get("SYMBOL"):
+            kept[r["SYMBOL"].upper() + ".NS"] = " ".join((r.get("NAME OF COMPANY") or "").split())
+    return sorted(kept.items()), counts
+
+
+def cmd_universe_nse(a):
+    if a.offline:
+        p = os.path.join(a.offline, NSE_FILE) if os.path.isdir(a.offline) else a.offline
+        if not os.path.exists(p):
+            raise ScanError("no %s in %s" % (NSE_FILE, a.offline))
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    else:
+        try:
+            text = http_get(NSE_EQUITY_URL, timeout=60)
+        except urllib.error.HTTPError as e:
+            raise ScanError("nseindia.com answered HTTP %d for %s" % (e.code, NSE_FILE))
+        except (urllib.error.URLError, OSError) as e:
+            raise ScanError("could not reach nseindia.com: %s" % getattr(e, "reason", e))
+    kept, counts = build_nse_universe(text)
+    out = a.out if a.out != DEFAULT_UNIVERSE else NSE_UNIVERSE
+    if not a.no_write:
+        d = os.path.dirname(out)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as fh:
+            for sym, name in kept:
+                fh.write("%s|%s\n" % (sym, name))
+    dropped = {k: v for k, v in counts.items() if k not in ("keep", "rows")}
+    if a.json:
+        print(json.dumps({"count": len(kept), "rows": counts["rows"], "dropped": dropped,
+                          "out": None if a.no_write else out}, indent=2))
+    else:
+        print("NSE equity list: %s rows." % "{:,}".format(counts["rows"]))
+        print("Kept %s NSE stocks in the EQ series (Yahoo symbols end in .NS)." % "{:,}".format(len(kept)))
+        if dropped:
+            print("Dropped: " + ", ".join("%s %s" % ("{:,}".format(v), k)
+                                          for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])) + ".")
+        if not a.no_write:
+            print("Wrote %s (one SYMBOL|Name a line)." % out)
+    return 0 if kept else 1
+
+
 def cmd_universe(a):
+    if MARKET["code"] == "in":
+        return cmd_universe_nse(a)
     t0 = time.time()
     texts = {}
     for k, fname in enumerate(NASDAQ_FILES):
@@ -995,8 +1215,9 @@ def cmd_orb(a):
     if a.json:
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
-    print("Opening-range breakout scan, %s %s ET: %d-minute range (9:30 to %s), 5-minute bars, Yahoo."
-          % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN))))
+    print("Opening-range breakout scan, %s %s ET: %d-minute range (%s to %s), 5-minute bars, Yahoo."
+          % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(OPEN).replace(" AM", ""),
+             clock_label(slot(day, a.or_minutes // BAR_MIN))))
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
              (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
@@ -1065,6 +1286,11 @@ def main(argv=None):
     p.add_argument("--at", help="cut the clock at this New York time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 15:30)")
     p.add_argument("--config", default="trader/config.json")
+    try:
+        argv = choose_market(argv)
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()

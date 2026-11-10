@@ -152,6 +152,40 @@ for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
 TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
 real XBRL facts. They reproduce every number in the example above.
 
+## India (NSE)
+
+The day-trade flow also runs on the National Stock Exchange of India. Add
+`--market in` to any command, set `TRADER_MARKET=in`, or put `"market": "in"`
+in `trader/config.json` (start from `trader-budget/config.india.example.json`).
+Nothing changes for US users who set nothing: `us` is the default.
+
+| | US (default) | India (`--market in`) |
+| --- | --- | --- |
+| exchange, clock | NYSE, New York time (ET) | NSE, Indian Standard Time (IST, UTC+5:30, no daylight saving) |
+| session | 9:30 to 16:00, NYSE holidays, 1:00 p.m. early closes | 9:15 to 15:30, the 2026 NSE trading holidays from the exchange circular |
+| default window | entries 09:45 to 15:30, flat by 15:55 | entries 09:30 to 14:45, flat by 15:10 (ahead of the brokers' intraday auto square-off) |
+| symbols | TSLA, BRK.B | RELIANCE becomes RELIANCE.NS (Yahoo's NSE symbol); TCS.BO for BSE |
+| money | $ | Rs; the `*_usd` config keys hold rupees |
+| universe | Nasdaq Trader lists | NSE's EQUITY_L.csv, the EQ series (`trader/universe-nse.txt`) |
+| orders | Alpaca or IBKR, three gates | written as an NSE intraday (MIS) bracket; no Indian broker connector yet, so you place it yourself |
+
+```bash
+python3 trader-scanner/scan.py --market in universe                 # NSE EQ stocks -> trader/universe-nse.txt
+python3 trader-scanner/scan.py --market in orb --at 09:50           # opening-range breakouts on NSE
+python3 trader-entry/entry.py --market in check RELIANCE --setup orb
+python3 trader-exit/exit.py --market in plan --write                # stop, target, flat by 15:10 IST
+python3 trader-timemachine/timemachine.py --market in run --write   # replays built from 75-bar NSE sessions
+python3 trader-budget/size.py --market in --write                   # sized in rupees
+python3 trader-risk/check.py --market in                            # PASS / BLOCK on the NSE clock
+python3 trader-alerts/alerts.py --market in clock                   # is NSE open today?
+```
+
+Not covered for India yet: the news monitor's filings, the earnings analyst
+(SEC data) and the Pelosi tracker (US Congress). The NSE holiday list covers
+2026; the tools warn on later dates until the 2027 circular is added. Brokerage,
+STT and exchange charges come on top of the max loss shown, and a stock at its
+circuit limit may not fill at all.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does
@@ -205,12 +239,12 @@ trader-entry/       SKILL.md, entry.py
 trader-exit/        SKILL.md, exit.py
 trader-timemachine/ SKILL.md, timemachine.py
 trader-risk/        SKILL.md, check.py
-trader-budget/      SKILL.md, size.py, config.example.json, targets.example.json
+trader-budget/      SKILL.md, size.py, config.example.json, config.india.example.json, targets.example.json
 trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
-tests/              unittest suite + offline fixtures
+tests/              unittest suite + offline fixtures (test_india.py: the NSE flow)
 ```
 
 MIT. Made by [Jake Schincariol](https://opusjake.ai).

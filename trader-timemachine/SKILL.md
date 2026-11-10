@@ -156,6 +156,10 @@ and never calls a result a sure thing. It never prints a P&L or a profit.
 It never uses a bar that has not closed yet, and never mixes today's bars
 into the pool.
 
+## India (NSE)
+
+Add `--market in` (or `"market": "in"` in `trader/config.json`, or `TRADER_MARKET=in`) to run on the National Stock Exchange of India: IST (UTC+5:30), the 9:15 to 15:30 session, the 2026 NSE holidays, rupees, and Yahoo's `.NS` symbols (RELIANCE becomes RELIANCE.NS; `.BO` for BSE). US is the default. An NSE session is 75 five-minute bars (9:15 to 15:30), so the replay pool is built from those.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

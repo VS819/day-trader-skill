@@ -44,7 +44,7 @@ import sys
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
-                 "stop_loss_limit_price", "advanced_instructions")
+                 "stop_loss_limit_price", "advanced_instructions", "exchange", "product")
 STRING_FIELDS = ("qty", "notional", "limit_price", "stop_price", "trail_price", "trail_percent",
                  "take_profit_limit_price", "stop_loss_stop_price", "stop_loss_limit_price")
 TIF_WORDS = {"day": "good for today", "gtc": "good until canceled", "opg": "at the open",
@@ -53,6 +53,159 @@ YES_WORDS = ("yes", "y")
 BATCH_WORDS = {"all", "every", "everything", "rest", "remaining", "them", "both", "batch", "each"}
 DOUBT_WORDS = {"no", "not", "dont", "don't", "wait", "cancel", "stop", "but", "maybe", "later",
                "hold", "unless", "if"}
+
+
+
+# ---------------------------------------------------------------- markets: us (NYSE, the default) or in (NSE India)
+# Pick one with --market us|in (anywhere on the command line), TRADER_MARKET, or "market" in
+# trader/config.json. US stays the default, so nothing changes for anyone who sets nothing.
+# The *_usd keys in the config hold amounts in the market's own currency (rupees for "in").
+
+NSE_HOLIDAYS = {  # NSE circular NSE/FAOP/71777 (Dec 12, 2025) plus NSE/CD/72233 (Jan 15 election)
+    "2026-01-15": "Municipal Corporation Election, Maharashtra",
+    "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+MARKETS = {
+    "us": {"code": "us", "exchange": "NYSE", "city": "New York", "zone": "ET", "currency": "$",
+           "open": datetime.time(9, 30), "close": datetime.time(16, 0), "early": datetime.time(13, 0),
+           "holidays": {}, "early_closes": {}, "holiday_years": (2026, 2027),
+           "flat_by": "15:55", "no_entries_before": "09:45", "no_entries_after": "15:30"},
+    "in": {"code": "in", "exchange": "NSE", "city": "Mumbai", "zone": "IST", "currency": "Rs ",
+           "open": datetime.time(9, 15), "close": datetime.time(15, 30), "early": None,
+           "holidays": NSE_HOLIDAYS, "early_closes": {}, "holiday_years": (2026,),
+           "flat_by": "15:10", "no_entries_before": "09:30", "no_entries_after": "14:45"},
+}
+MARKET = MARKETS["us"]
+
+
+def set_market(code):
+    """Switch this script to a market: "us" or "in". Rebinds OPEN, CLOSE and EARLY."""
+    global MARKET
+    code = str(code or "us").strip().lower()
+    code = {"nyse": "us", "nasdaq": "us", "usa": "us", "nse": "in", "india": "in", "bse": "in"}.get(code, code)
+    if code not in MARKETS:
+        raise ValueError("--market is us or in, not %r" % code)
+    MARKET = MARKETS[code]
+    g = globals()
+    for name, key in (("OPEN", "open"), ("CLOSE", "close"), ("EARLY", "early")):
+        if name in g:
+            g[name] = MARKET[key]      # EARLY is None where the market has no early closes
+    o, c = MARKET["open"], MARKET["close"]
+    e = MARKET["early"] or c
+    for name, val in (("OPEN_MIN", o.hour * 60 + o.minute), ("CLOSE_MIN", c.hour * 60 + c.minute),
+                      ("EARLY_MIN", e.hour * 60 + e.minute),
+                      ("SESSION_BARS", ((c.hour - o.hour) * 60 + c.minute - o.minute) // 5)):
+        if name in g:
+            g[name] = val
+    if isinstance(g.get("DEFAULTS"), dict):      # the entry window and flat-by follow the market
+        for k in ("no_entries_before", "no_entries_after", "flat_by"):
+            if k in g["DEFAULTS"]:
+                g["DEFAULTS"][k] = MARKET[k]
+    return MARKET
+
+
+def take_market(argv):
+    """Strip --market X from argv. Returns (code or None, the rest)."""
+    out, code, i = [], None, 0
+    argv = list(argv)
+    while i < len(argv):
+        x = argv[i]
+        if x == "--market" and i + 1 < len(argv):
+            code, i = argv[i + 1], i + 2
+            continue
+        if x.startswith("--market="):
+            code = x.split("=", 1)[1]
+        else:
+            out.append(x)
+        i += 1
+    return code, out
+
+
+class _LocalWords(object):
+    """With --market in, the words a person reads follow the market: $ -> Rs, ET -> IST,
+    New York -> Mumbai, NYSE -> NSE. Wraps stdout only; files and JSON keys are untouched."""
+    SWAPS = ((re.compile(r"\$(?=[0-9(+-])"), "Rs "), (re.compile(r"\bET\b"), "IST"),
+             (re.compile(r"New York"), "Mumbai"), (re.compile(r"\bNYSE\b"), "NSE"))
+
+    def __init__(self, stream):
+        self._s = stream
+
+    def write(self, text):
+        for rx, rep in self.SWAPS:
+            text = rx.sub(rep, text)
+        return self._s.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
+def choose_market(argv, config_path="trader/config.json"):
+    """--market, then TRADER_MARKET, then "market" in the config, then us. Returns the rest of argv."""
+    code, rest = take_market(sys.argv[1:] if argv is None else argv)
+    if not code:
+        code = os.environ.get("TRADER_MARKET")
+    if not code:
+        for i, x in enumerate(rest):
+            if x == "--config" and i + 1 < len(rest):
+                config_path = rest[i + 1]
+            elif x.startswith("--config="):
+                config_path = x.split("=", 1)[1]
+        try:
+            with open(config_path, encoding="utf-8") as fh:
+                code = (json.load(fh) or {}).get("market")
+        except (OSError, ValueError, AttributeError):
+            code = None
+    set_market(code or "us")
+    if MARKET["code"] != "us" and not isinstance(sys.stdout, _LocalWords):
+        sys.stdout = _LocalWords(sys.stdout)
+    return rest
+
+
+def market_symbol(sym):
+    """The symbol as this pack stores it: TSLA, or RELIANCE.NS / RELIANCE.BO on NSE / BSE."""
+    s = str(sym or "").strip().upper()
+    if MARKET["code"] == "in" and s and not s.endswith((".NS", ".BO")):
+        s += ".NS"
+    return s
+
+
+def yahoo_symbol(sym):
+    """Yahoo's spelling: BRK-B for BRK.B in the US; RELIANCE.NS as is in India."""
+    if MARKET["code"] == "in":
+        return market_symbol(sym)
+    return str(sym).upper().replace(".", "-")
+
+
+def url_symbol(sym):
+    """yahoo_symbol, made safe for a URL: M&M.NS -> M%26M.NS."""
+    import urllib.parse
+    return urllib.parse.quote(yahoo_symbol(sym), safe=".-^=")
+
+
+def cur():
+    return MARKET["currency"]
+
+
+def holiday_note(day):
+    """A warning when the market's holiday list does not cover this year yet."""
+    if day.year not in MARKET["holiday_years"]:
+        return ("%s has no %s holiday list for %d in this tool yet: weekends are closed, but check the "
+                "exchange's holiday circular before trusting an open day" % (MARKET["exchange"], MARKET["exchange"], day.year))
+    return ""
 
 
 class TicketError(Exception):
@@ -68,6 +221,8 @@ def _nth_sunday(year, month, n):
 
 
 def eastern_offset(utc):
+    if MARKET["code"] == "in":
+        return 5.5      # India: UTC+5:30, no daylight saving
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
@@ -83,6 +238,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["code"] == "in":
+        return local - datetime.timedelta(hours=5.5)
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -179,7 +336,7 @@ def tool_input(order):
 def _money(v):
     f = float(v)
     s = "{:,.2f}".format(f)
-    return "$" + (s[:-3] if s.endswith(".00") else s)
+    return cur() + (s[:-3] if s.endswith(".00") else s)
 
 
 def _p(v):
@@ -349,12 +506,30 @@ def kind_of(order, rv):
 
 # ---------------------------------------------------------------- rendering
 
+def broker_of(cfg):
+    """alpaca, ibkr, or manual. India has no broker connector in this pack yet: you place it yourself."""
+    b = str(cfg.get("broker", "alpaca")).lower()
+    if MARKET["code"] == "in" and b in ("alpaca", "ibkr"):
+        return "manual"
+    return b
+
+
+MANUAL_IN = ("No Indian broker connector in this pack yet, so Claude will not place this. Place it yourself in "
+             "your broker's app (Zerodha Kite, Groww, Upstox, ...) as an intraday (MIS) order, put the stop-loss "
+             "(SL-M) in right after the buy fills, and exit by the flat-by time.")
+
+
 def render(order, idx, total, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
-    broker = str(cfg.get("broker", "alpaca")).lower()
+    broker = broker_of(cfg)
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    if broker == "manual":
+        acct = "you place it yourself" + (" (paper: practise it on paper or in your broker's demo)" if paper else "")
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, {"ibkr": "Interactive Brokers",
+                                                            "manual": "your broker (%s)"
+                                                            % (order.get("exchange") or MARKET["exchange"])}
+                                          .get(broker, "Alpaca"))]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -362,7 +537,9 @@ def render(order, idx, total, cfg, risk, state, today):
     lines.append("  " + label)
     for w in (rv or {}).get("warnings", []):
         lines.append("  note: " + w)
-    if broker == "ibkr":
+    if broker == "manual":
+        lines.append("  " + MANUAL_IN)
+    elif broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
@@ -372,7 +549,9 @@ def render(order, idx, total, cfg, risk, state, today):
         if is_bracket(order):
             lines.append("  Alpaca places the entry, then the stop-loss and the take-profit as two orders")
             lines.append("  that cancel each other: when one fills, the other is canceled.")
-    if ready:
+    if ready and broker == "manual":
+        lines.append("  Reply \"yes\" to record that you are taking this one trade, or \"no\" to skip it.")
+    elif ready:
         lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
         if broker != "ibkr":
             lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
@@ -516,7 +695,11 @@ def cmd_approve(a):
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
+    if broker_of(cfg) == "manual":
+        print(MANUAL_IN)
+        print("Once it fills: ticket.py result --index %d --status placed --filled-qty N --filled-price P"
+              % a.index)
+    elif str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
     else:
         print("Now call place_stock_order with exactly:")
@@ -602,10 +785,12 @@ def cmd_flatten(a):
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
     plan = read_json(a.plan, "plan", required=False) or {}
     flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
-        or cfg.get("flat_by") or "15:55"
+        or cfg.get("flat_by") or MARKET["flat_by"]
     order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
-             "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
-             % (flat_by, sym, source)}
+             "why": "flat by %s %s: closes the %s day trade before the close (qty from %s)"
+             % (flat_by, MARKET["city"], sym, source)}
+    if MARKET["code"] == "in":
+        order.update(exchange="BSE" if sym.endswith(".BO") else "NSE", product="MIS")
     old = read_json(a.orders, "orders", required=False)
     replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
     doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
@@ -613,7 +798,7 @@ def cmd_flatten(a):
            "note": "Flatten ticket. Nothing is placed until trader-risk passes it and you say yes in the chat.",
            "source": "ticket.py flatten %s on %s" % (sym, today), "orders": [order]}
     write_json(a.orders, doc)
-    print("Flatten %s: %s (flat by %s New York)." % (sym, plain(order), flat_by))
+    print("Flatten %s: %s (flat by %s %s)." % (sym, plain(order), flat_by, MARKET["city"]))
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
     if a.qty is None:
@@ -622,6 +807,10 @@ def cmd_flatten(a):
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
+    if broker_of(cfg) == "manual":
+        print("  3. In your broker's app: cancel the open stop-loss and target first, then sell. Your broker")
+        print("     also squares off open MIS positions on its own near the close, often with a charge.")
+        return 0
     print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
     print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
     print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
@@ -651,8 +840,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def clock(p):
-        p.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
-        p.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
+        p.add_argument("--now", help="pretend it is this market time (New York or IST), e.g. \"2026-10-19 10:15\"")
+        p.add_argument("--today", help="YYYY-MM-DD (default: today in the market's time zone)")
 
     def common(p):
         p.add_argument("--orders", default="trader/orders.json")
@@ -704,6 +893,11 @@ def main(argv=None):
     p.add_argument("--state", default="trader/state/broker.json")
     clock(p)
     p.add_argument("--all", action="store_true")
+    try:
+        argv = choose_market(argv)
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()

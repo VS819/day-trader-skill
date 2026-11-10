@@ -200,6 +200,10 @@ buttons: Allow once, Deny. Allow once sends it to the paper account. The
 - Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.
 - Never promises a fill price: a market order and a stop fill at whatever the market gives.
 
+## India (NSE)
+
+Add `--market in` (or `"market": "in"` in `trader/config.json`, or `TRADER_MARKET=in`) to run on the National Stock Exchange of India: IST (UTC+5:30), the 9:15 to 15:30 session, the 2026 NSE holidays, rupees, and Yahoo's `.NS` symbols (RELIANCE becomes RELIANCE.NS; `.BO` for BSE). US is the default. There is no Indian broker connector in this pack yet. With `--market in` the ticket says so: the user places the order in their own broker's app (an intraday MIS order with its stop-loss), and a yes only records that they are taking it. Claude never calls a US broker tool for an Indian order.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

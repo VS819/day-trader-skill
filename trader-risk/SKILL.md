@@ -160,6 +160,10 @@ It never places an order, never edits an order to make it pass, never
 loosens a limit, never blocks a sell that only gets the user out, and never
 treats a PASS as the user's yes.
 
+## India (NSE)
+
+Add `--market in` (or `"market": "in"` in `trader/config.json`, or `TRADER_MARKET=in`) to run on the National Stock Exchange of India: IST (UTC+5:30), the 9:15 to 15:30 session, the 2026 NSE holidays, rupees, and Yahoo's `.NS` symbols (RELIANCE becomes RELIANCE.NS; `.BO` for BSE). US is the default. A ticker must look like an NSE or BSE stock (RELIANCE.NS, M&M.NS, TCS.BO). The window and holidays follow the NSE clock.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

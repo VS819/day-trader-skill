@@ -120,6 +120,10 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
 It never places an order, never sizes a position, never widens a stop to
 make a plan pass, and never calls a stop a guarantee.
 
+## India (NSE)
+
+Add `--market in` (or `"market": "in"` in `trader/config.json`, or `TRADER_MARKET=in`) to run on the National Stock Exchange of India: IST (UTC+5:30), the 9:15 to 15:30 session, the 2026 NSE holidays, rupees, and Yahoo's `.NS` symbols (RELIANCE becomes RELIANCE.NS; `.BO` for BSE). US is the default. The default flat-by is 15:10 IST, ahead of the brokers' intraday (MIS) auto square-off. The plan records `"market": "in"`, and the next skills refuse it under the other market.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

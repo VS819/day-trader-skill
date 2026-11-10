@@ -132,6 +132,10 @@ is `/trader-exit`), never moves the level after the fact, and never counts a
 bar that has not closed. It never runs `/trader-broker` from a background
 watch: nobody is there to say yes.
 
+## India (NSE)
+
+Add `--market in` (or `"market": "in"` in `trader/config.json`, or `TRADER_MARKET=in`) to run on the National Stock Exchange of India: IST (UTC+5:30), the 9:15 to 15:30 session, the 2026 NSE holidays, rupees, and Yahoo's `.NS` symbols (RELIANCE becomes RELIANCE.NS; `.BO` for BSE). US is the default. The 15-minute opening range is the 9:15, 9:20 and 9:25 bars; the default entry window is 09:30 to 14:45 IST.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

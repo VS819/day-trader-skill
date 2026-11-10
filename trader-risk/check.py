@@ -78,13 +78,14 @@ DEFAULTS = {
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
-                 "stop_loss_limit_price", "advanced_instructions")
+                 "stop_loss_limit_price", "advanced_instructions", "exchange", "product")
 PRICE_FIELDS = ("qty", "notional", "limit_price", "stop_price", "take_profit_limit_price",
                 "stop_loss_stop_price", "stop_loss_limit_price")
 TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 TIFS = {"day", "gtc", "opg", "cls", "ioc", "fok"}
 OCC = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
 TICKER = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
+TICKER_IN = re.compile(r"^[A-Z0-9][A-Z0-9&\-]{0,19}\.(NS|BO)$")   # RELIANCE.NS, M&M.NS, BAJAJ-AUTO.BO
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 CENT = 0.005
 FRESH_MINUTES = 15
@@ -123,6 +124,157 @@ OPEN = datetime.time(9, 30)
 CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
 
+# ---------------------------------------------------------------- markets: us (NYSE, the default) or in (NSE India)
+# Pick one with --market us|in (anywhere on the command line), TRADER_MARKET, or "market" in
+# trader/config.json. US stays the default, so nothing changes for anyone who sets nothing.
+# The *_usd keys in the config hold amounts in the market's own currency (rupees for "in").
+
+NSE_HOLIDAYS = {  # NSE circular NSE/FAOP/71777 (Dec 12, 2025) plus NSE/CD/72233 (Jan 15 election)
+    "2026-01-15": "Municipal Corporation Election, Maharashtra",
+    "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+MARKETS = {
+    "us": {"code": "us", "exchange": "NYSE", "city": "New York", "zone": "ET", "currency": "$",
+           "open": datetime.time(9, 30), "close": datetime.time(16, 0), "early": datetime.time(13, 0),
+           "holidays": NYSE_HOLIDAYS, "early_closes": NYSE_EARLY_CLOSE, "holiday_years": (2026, 2027),
+           "flat_by": "15:55", "no_entries_before": "09:45", "no_entries_after": "15:30"},
+    "in": {"code": "in", "exchange": "NSE", "city": "Mumbai", "zone": "IST", "currency": "Rs ",
+           "open": datetime.time(9, 15), "close": datetime.time(15, 30), "early": None,
+           "holidays": NSE_HOLIDAYS, "early_closes": {}, "holiday_years": (2026,),
+           "flat_by": "15:10", "no_entries_before": "09:30", "no_entries_after": "14:45"},
+}
+MARKET = MARKETS["us"]
+
+
+def set_market(code):
+    """Switch this script to a market: "us" or "in". Rebinds OPEN, CLOSE and EARLY."""
+    global MARKET
+    code = str(code or "us").strip().lower()
+    code = {"nyse": "us", "nasdaq": "us", "usa": "us", "nse": "in", "india": "in", "bse": "in"}.get(code, code)
+    if code not in MARKETS:
+        raise ValueError("--market is us or in, not %r" % code)
+    MARKET = MARKETS[code]
+    g = globals()
+    for name, key in (("OPEN", "open"), ("CLOSE", "close"), ("EARLY", "early")):
+        if name in g:
+            g[name] = MARKET[key]      # EARLY is None where the market has no early closes
+    o, c = MARKET["open"], MARKET["close"]
+    e = MARKET["early"] or c
+    for name, val in (("OPEN_MIN", o.hour * 60 + o.minute), ("CLOSE_MIN", c.hour * 60 + c.minute),
+                      ("EARLY_MIN", e.hour * 60 + e.minute),
+                      ("SESSION_BARS", ((c.hour - o.hour) * 60 + c.minute - o.minute) // 5)):
+        if name in g:
+            g[name] = val
+    if isinstance(g.get("DEFAULTS"), dict):      # the entry window and flat-by follow the market
+        for k in ("no_entries_before", "no_entries_after", "flat_by"):
+            if k in g["DEFAULTS"]:
+                g["DEFAULTS"][k] = MARKET[k]
+    return MARKET
+
+
+def take_market(argv):
+    """Strip --market X from argv. Returns (code or None, the rest)."""
+    out, code, i = [], None, 0
+    argv = list(argv)
+    while i < len(argv):
+        x = argv[i]
+        if x == "--market" and i + 1 < len(argv):
+            code, i = argv[i + 1], i + 2
+            continue
+        if x.startswith("--market="):
+            code = x.split("=", 1)[1]
+        else:
+            out.append(x)
+        i += 1
+    return code, out
+
+
+class _LocalWords(object):
+    """With --market in, the words a person reads follow the market: $ -> Rs, ET -> IST,
+    New York -> Mumbai, NYSE -> NSE. Wraps stdout only; files and JSON keys are untouched."""
+    SWAPS = ((re.compile(r"\$(?=[0-9(+-])"), "Rs "), (re.compile(r"\bET\b"), "IST"),
+             (re.compile(r"New York"), "Mumbai"), (re.compile(r"\bNYSE\b"), "NSE"))
+
+    def __init__(self, stream):
+        self._s = stream
+
+    def write(self, text):
+        for rx, rep in self.SWAPS:
+            text = rx.sub(rep, text)
+        return self._s.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
+def choose_market(argv, config_path="trader/config.json"):
+    """--market, then TRADER_MARKET, then "market" in the config, then us. Returns the rest of argv."""
+    code, rest = take_market(sys.argv[1:] if argv is None else argv)
+    if not code:
+        code = os.environ.get("TRADER_MARKET")
+    if not code:
+        for i, x in enumerate(rest):
+            if x == "--config" and i + 1 < len(rest):
+                config_path = rest[i + 1]
+            elif x.startswith("--config="):
+                config_path = x.split("=", 1)[1]
+        try:
+            with open(config_path, encoding="utf-8") as fh:
+                code = (json.load(fh) or {}).get("market")
+        except (OSError, ValueError, AttributeError):
+            code = None
+    set_market(code or "us")
+    if MARKET["code"] != "us" and not isinstance(sys.stdout, _LocalWords):
+        sys.stdout = _LocalWords(sys.stdout)
+    return rest
+
+
+def market_symbol(sym):
+    """The symbol as this pack stores it: TSLA, or RELIANCE.NS / RELIANCE.BO on NSE / BSE."""
+    s = str(sym or "").strip().upper()
+    if MARKET["code"] == "in" and s and not s.endswith((".NS", ".BO")):
+        s += ".NS"
+    return s
+
+
+def yahoo_symbol(sym):
+    """Yahoo's spelling: BRK-B for BRK.B in the US; RELIANCE.NS as is in India."""
+    if MARKET["code"] == "in":
+        return market_symbol(sym)
+    return str(sym).upper().replace(".", "-")
+
+
+def url_symbol(sym):
+    """yahoo_symbol, made safe for a URL: M&M.NS -> M%26M.NS."""
+    import urllib.parse
+    return urllib.parse.quote(yahoo_symbol(sym), safe=".-^=")
+
+
+def cur():
+    return MARKET["currency"]
+
+
+def holiday_note(day):
+    """A warning when the market's holiday list does not cover this year yet."""
+    if day.year not in MARKET["holiday_years"]:
+        return ("%s has no %s holiday list for %d in this tool yet: weekends are closed, but check the "
+                "exchange's holiday circular before trusting an open day" % (MARKET["exchange"], MARKET["exchange"], day.year))
+    return ""
+
 
 class RiskError(Exception):
     pass
@@ -137,6 +289,8 @@ def _nth_sunday(year, month, n):
 
 
 def eastern_offset(utc):
+    if MARKET["code"] == "in":
+        return 5.5      # India: UTC+5:30, no daylight saving
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
@@ -152,6 +306,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["code"] == "in":
+        return local - datetime.timedelta(hours=5.5)
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -189,7 +345,7 @@ def trading_day(d):
     """(is_trading_day, reason). Weekends and the NYSE holiday list."""
     if d.weekday() >= 5:
         return False, "weekend"
-    name = NYSE_HOLIDAYS.get(d.isoformat())
+    name = MARKET["holidays"].get(d.isoformat())
     if name:
         return False, "NYSE holiday: " + name
     return True, ""
@@ -201,7 +357,8 @@ def hhmm(value, key):
         return None
     m = HHMM.match(str(value).strip())
     if not m:
-        raise RiskError("%s must be a New York time like \"09:45\", got %r" % (key, value))
+        raise RiskError("%s must be a %s time like \"%s\", got %r" % (key, MARKET["city"],
+                                                                     MARKET["no_entries_before"], value))
     return datetime.time(int(m.group(1)), int(m.group(2)))
 
 
@@ -218,27 +375,29 @@ def window_check(now_et, c):
         return [], []
     warns = []
     d, t = now_et.date(), now_et.time().replace(second=0, microsecond=0)
-    if d.year not in CALENDAR_YEARS:
-        warns.append("the holiday list covers %s only: check nyse.com for %s"
-                     % (" and ".join(map(str, CALENDAR_YEARS)), d.isoformat()))
+    years = CALENDAR_YEARS if MARKET["code"] == "us" else MARKET["holiday_years"]
+    if d.year not in years:
+        warns.append("the holiday list covers %s only: check %s for %s"
+                     % (" and ".join(map(str, years)), "nyse.com" if MARKET["code"] == "us" else "nseindia.com",
+                        d.isoformat()))
     ok, why = trading_day(d)
     stamp = now_et.strftime("%a %Y-%m-%d %H:%M")
     if not ok:
-        return ["window: the market is closed today (%s, %s New York)" % (why, stamp)], warns
-    close = EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE
+        return ["window: the market is closed today (%s, %s %s)" % (why, stamp, MARKET["city"])], warns
+    close = EARLY if d.isoformat() in MARKET["early_closes"] else CLOSE
     if t < OPEN or now_et.time() >= close:
-        return ["window: the market is closed (%s New York; the session is %s to %s)"
-                % (stamp, OPEN.strftime("%H:%M"), close.strftime("%H:%M"))], warns
+        return ["window: the market is closed (%s %s; the session is %s to %s)"
+                % (stamp, MARKET["city"], OPEN.strftime("%H:%M"), close.strftime("%H:%M"))], warns
     if close == EARLY and after is not None:
         after = _shift(after, 3)
         warns.append("early close at 1:00 p.m. today (%s): no new entries after %s"
-                     % (NYSE_EARLY_CLOSE[d.isoformat()], after.strftime("%H:%M")))
+                     % (MARKET["early_closes"][d.isoformat()], after.strftime("%H:%M")))
     if before is not None and t < before:
-        return ["window: no new entries before %s New York (it is %s)" % (before.strftime("%H:%M"),
-                                                                          t.strftime("%H:%M"))], warns
+        return ["window: no new entries before %s %s (it is %s)" % (before.strftime("%H:%M"), MARKET["city"],
+                                                                   t.strftime("%H:%M"))], warns
     if after is not None and t > after:
-        return ["window: no new entries after %s New York (it is %s)" % (after.strftime("%H:%M"),
-                                                                         t.strftime("%H:%M"))], warns
+        return ["window: no new entries after %s %s (it is %s)" % (after.strftime("%H:%M"), MARKET["city"],
+                                                                  t.strftime("%H:%M"))], warns
     return [], warns
 
 
@@ -283,7 +442,7 @@ def _f(x):
 
 
 def money(x):
-    return "$" + "{:,.2f}".format(float(x)).replace(".00", "")
+    return cur() + "{:,.2f}".format(float(x)).replace(".00", "")
 
 
 def _cent(x):
@@ -373,9 +532,11 @@ def day_trades(state, today):
 def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
-    now          naive UTC (default: the real clock); its New York date is "today"
+    now          naive UTC (default: the real clock); its market-local date is "today"
     price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
     c = dict(DEFAULTS)
+    for k in ("no_entries_before", "no_entries_after", "flat_by"):
+        c[k] = MARKET[k]
     c.update(cfg or {})
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
     now_utc = now or parse_now(None)
@@ -479,9 +640,16 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                "(\"allow_options\": false)" % sym)
             else:
                 warns.append("option order: options can lose 100%% of what you pay")
-        elif sym and ("/" in sym or not TICKER.match(sym)):
+        elif sym and MARKET["code"] == "in" and not TICKER_IN.match(sym):
+            reasons.append("asset: %s does not look like an NSE or BSE stock (RELIANCE.NS, TCS.BO); "
+                           "with --market in this pack trades Indian cash-market stocks only" % sym)
+        elif sym and MARKET["code"] == "us" and ("/" in sym or not TICKER.match(sym)):
             reasons.append("asset: %s does not look like a US stock or ETF ticker; "
                            "this pack trades stocks and ETFs only" % sym)
+        om = str(plan.get("market") or "").lower()
+        if om and om != MARKET["code"]:
+            reasons.append("market: this order was sized for the %s market but the check runs for %s; "
+                           "run it with --market %s" % (om, MARKET["exchange"], om))
 
         # the reference price: what one share costs to get in
         plan_entry = _f(plan.get("entry"))
@@ -731,8 +899,8 @@ def report(res):
         for x in r["warnings"]:
             lines.append("        ~ " + x)
     lines.append("")
-    lines.append("%d passed, %d blocked at %s New York. Cash after the passed orders: %s (%s account)."
-                 % (res["pass"], res["block"], res["now_new_york"], money(res["cash_after"]),
+    lines.append("%d passed, %d blocked at %s %s. Cash after the passed orders: %s (%s account)."
+                 % (res["pass"], res["block"], res["now_new_york"], MARKET["city"], money(res["cash_after"]),
                     "paper" if res["paper"] else "LIVE"))
     if res["block"]:
         lines.append("Blocked orders do not go to the broker. Fix the order or your rules, then check again.")
@@ -773,11 +941,16 @@ def main(argv=None):
                     help="your account; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default="trader/prices.json")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
-    ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
-    ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
+    ap.add_argument("--now", help="pretend it is this market time (New York or IST), e.g. \"2026-10-19 10:15\"")
+    ap.add_argument("--today", help="YYYY-MM-DD (default: today in the market's time zone)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
     ap.add_argument("--no-write", action="store_true", help="do not record the verdicts")
     ap.add_argument("--json", action="store_true")
+    try:
+        argv = choose_market(argv)
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
     a = ap.parse_args(argv)
     try:
         now = parse_now(a.now)
